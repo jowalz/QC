@@ -1,0 +1,164 @@
+# region imports
+from AlgorithmImports import *
+# endregion
+from datetime import timedelta
+
+class OpeningRangeBreakout(QCAlgorithm):
+
+    def Initialize(self):
+        self.SetStartDate(2025, 1, 1)
+        self.SetCash(25000)
+
+        self.UniverseSettings.Resolution = Resolution.Daily
+        self.UniverseSettings.UniverseResolution = Resolution.Daily
+
+        self.AddEquity("SPY", Resolution.Daily)  # Benchmark
+
+        self.commission = 0.0035
+        self.lookback = 14
+        self.orb_period = timedelta(minutes=5)
+        self.stocks = {}
+        self.traded_today = set()
+
+        self.AddUniverse(self.CoarseSelectionFunction, self.FineSelectionFunction)
+
+    def CoarseSelectionFunction(self, coarse):
+        return [c.Symbol for c in coarse if c.Price > 5 and c.Volume > 1000000]
+
+    def FineSelectionFunction(self, fine):
+        return [f.Symbol for f in fine if f.Price > 5]
+
+    def OnSecuritiesChanged(self, changes):
+        for security in changes.AddedSecurities:
+            symbol = security.Symbol
+            if symbol not in self.stocks:
+                self.AddEquity(symbol.Value, Resolution.Minute)
+                self.Securities[symbol].SetDataNormalizationMode(DataNormalizationMode.Raw)
+                
+                # Create and register ATR
+                atr_indicator = self.ATR(symbol, self.lookback, Resolution.Daily)
+                self.stocks[symbol] = StockData(self, symbol, self.lookback, atr_indicator)
+
+
+    def OnData(self, data):
+        for symbol in list(self.stocks.keys()):
+            if symbol in data:
+                bar = data[symbol]
+                self.stocks[symbol].Update(bar)
+
+        # 09:35 breakout check
+        if self.Time.hour == 9 and self.Time.minute == 35:
+            self.CheckAndTrade()
+
+        # Midnight reset
+        if self.Time.hour == 0 and self.Time.minute == 0:
+            self.traded_today.clear()
+
+    def CheckAndTrade(self):
+        eligible_stocks = []
+        for symbol, stock_data in self.stocks.items():
+            if not stock_data.IsReady or symbol in self.traded_today:
+                continue
+            if stock_data.PreviousDayOpen > 5:
+                eligible_stocks.append(symbol)
+
+        eligible_stocks.sort(key=lambda s: self.stocks[s].RelativeVolume, reverse=True)
+        top_stocks = eligible_stocks[:20]
+
+        for symbol in top_stocks:
+            self.TradeStock(symbol)
+
+    def TradeStock(self, symbol):
+        stock_data = self.stocks[symbol]
+        if stock_data.FirstCandleOpen is None:
+            return
+
+        atr = stock_data.atr.Current.Value
+        if atr <= 0:
+            return
+
+        if stock_data.FirstCandleClose > stock_data.FirstCandleOpen:
+            entry_type = "Long"
+            entry_price = stock_data.ORBHigh
+            stop_loss_price = entry_price - 0.10 * atr
+            risk_per_share = entry_price - stop_loss_price
+            direction = 1
+        elif stock_data.FirstCandleClose < stock_data.FirstCandleOpen:
+            entry_type = "Short"
+            entry_price = stock_data.ORBLow
+            stop_loss_price = entry_price + 0.10 * atr
+            risk_per_share = stop_loss_price - entry_price
+            direction = -1
+        else:
+            return  # Doji
+
+        if risk_per_share == 0:
+            return
+
+        shares = int(self.Portfolio.TotalPortfolioValue * 0.01 / risk_per_share)
+        if shares <= 0:
+            return
+
+        if (direction == 1 and not self.Portfolio[symbol].IsLong) or \
+           (direction == -1 and not self.Portfolio[symbol].IsShort):
+
+            self.StopMarketOrder(symbol, direction * shares, entry_price)
+            self.Debug(f"Go {entry_type} {symbol} at {entry_price}, Stop: {stop_loss_price}")
+            stock_data.stop_loss = stop_loss_price
+            self.traded_today.add(symbol)
+
+    def OnEndOfDay(self, symbol):
+        if self.Portfolio[symbol].Invested:
+            self.Liquidate(symbol)
+            self.Debug(f"Liquidate {symbol} at EOD")
+
+class StockData:
+    def __init__(self, algorithm, symbol, lookback):
+        self.algo = algorithm
+        self.Symbol = symbol
+        self.atr = atr_indicator  # Pass in registered ATR
+        self.lookback = lookback
+
+        self.ATR = RollingWindow[float](lookback)
+        self.Volume = RollingWindow[float](lookback)
+        self.atr = AverageTrueRange(symbol, lookback, Resolution.Daily)
+        self.algo.RegisterIndicator(symbol, self.atr)
+
+        self.ORBHigh = float('-inf')
+        self.ORBLow = float('inf')
+        self.FirstCandleOpen = None
+        self.FirstCandleClose = None
+        self.PreviousDayOpen = 0.0
+        self.TotalVolumeFirstFiveMinutes = 0.0
+        self.TotalVolumePreviousDays = 0.0
+        self.RelativeVolume = 0.0
+        self.stop_loss = None
+
+    def Update(self, bar):
+        if self.algo.Time.hour == 9 and self.algo.Time.minute < 35:
+            self.ORBHigh = max(self.ORBHigh, bar.High)
+            self.ORBLow = min(self.ORBLow, bar.Low)
+            if self.FirstCandleOpen is None:
+                self.FirstCandleOpen = bar.Open
+            self.FirstCandleClose = bar.Close
+            self.TotalVolumeFirstFiveMinutes += bar.Volume
+
+        if self.atr.IsReady:
+            self.ATR.Add(self.atr.Current.Value)
+
+        self.Volume.Add(bar.Volume)
+        self.PreviousDayOpen = bar.Open
+        self.TotalVolumePreviousDays += bar.Volume
+
+    def CalculateRelativeVolume(self):
+        if self.Volume.Samples > 0 and self.TotalVolumePreviousDays > 0:
+            avg_volume = self.TotalVolumePreviousDays / self.Volume.Samples
+            if avg_volume > 0:
+                self.RelativeVolume = self.TotalVolumeFirstFiveMinutes / avg_volume
+
+    @property
+    def IsReady(self):
+        if self.Volume.Samples < self.Volume.Capacity or not self.atr.IsReady:
+            return False
+        self.CalculateRelativeVolume()
+        return self.RelativeVolume >= 1
