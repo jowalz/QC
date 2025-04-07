@@ -1,0 +1,51 @@
+# region imports
+from AlgorithmImports import *
+# endregion
+
+class OpeningRangeBreakout(QCAlgorithm):
+    
+    filteredByPrice = None
+    
+    def Initialize(self):
+        # ✅ Set the start and end dates for the algorithm, defining the backtesting period.
+        self.set_start_date(datetime.now() - timedelta(30)) # Set the start date to 365 = 1 year ago.
+        # self.set_end_date(2026, 1, 1) # Set the end date to January 1, 2026. 
+        # ✅ Set the account currency and your starting cash.
+        self.set_account_currency("EUR") # Set the account currency to EUR and its quantity to 10000 EUR.
+        self.SetCash("EUR", 100000)
+        # ✅ Set the brokerage model and account type to model fees, supported order types, and available margin.
+        self.set_brokerage_model(BrokerageName.INTERACTIVE_BROKERS_BROKERAGE, AccountType.MARGIN)
+        # To best simulate IB's margin requirement, set the leverage to 50%.
+        self.universe_settings.leverage = 2
+        # ✅ Sets the time zone 
+        self.set_time_zone("Europe/Amsterdam")
+        self.settings.daily_precise_end_time = False 
+        # Since we trade by market order, we cannot use extended market hours data to fill.
+        self.universe_settings.extended_market_hours = False
+        # Add a universe with custom selection rules for filtering.
+        self.universe_settings.asynchronous = False # true used for better performance
+        self.UniverseSettings.Resolution = Resolution.Hour
+        self.AddUniverse(self.CoarseSelectionFilter)
+        self.set_warm_up(timedelta(7)) # Wind time back 7 days from the start date
+        # Schedule the universe selection to run at the start of each week.
+        self.universe_settings.schedule.on(self.date_rules.month_start())
+        self.SetRiskManagement(NullRiskManagementModel()) # Risk model
+        self.SetExecution(ImmediateExecutionModel()) # Execution model
+       
+    def CoarseSelectionFilter(self, coarse):
+        sortedByDollarVolume = sorted(coarse, key=lambda c: c.DollarVolume, reverse=True)
+        filteredByPrice = [c.Symbol for c in sortedByDollarVolume if c.Price > 10]
+        return filteredByPrice[:10] 
+        
+    # Use the on_securities_changed method to know when an asset is added or removed.
+    def on_securities_changed(self, changes: SecurityChanges) -> None:
+        # Iterate through the added securities.
+        for security in changes.added_securities:
+            self.debug(f"{self.time}: Added {security.symbol}")
+            self.SetHoldings(security.Symbol, 0.18)
+
+        # Iterate through the removed securities.
+        for security in changes.removed_securities:
+            self.debug(f"{self.time}: Removed {security.symbol}")        
+            if security.invested:
+                self.liquidate(security.symbol, "Removed from Universe")
