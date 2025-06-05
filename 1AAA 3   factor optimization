@@ -10,8 +10,8 @@ class FactorWeightOptimizationAlgorithm(QCAlgorithm):
         self.set_start_date(2024, 1, 1)
         # Set the starting cash for the portfolio
         self.set_cash(100000)
-        # Set the percentage of the portfolio to trade 0.50 = 55%
-        # self.set_holdings = 0.50
+        # Set the percentage of the portfolio to trade 0.50 = 50%
+        self.capital_allocation_ratio = 1.00 
         # Enable automatic warm-up of indicators
         self.settings.automatic_indicator_warm_up = True
 
@@ -155,12 +155,13 @@ class FactorWeightOptimizationAlgorithm(QCAlgorithm):
 
         # Normalize portfolio weights and set holdings
         self.set_holdings(
-            [PortfolioTarget(symbol, weight / portfolio_weights.sum()) for symbol, weight in portfolio_weights.items()],
+            [PortfolioTarget(symbol, weight / portfolio_weights.sum() * self.capital_allocation_ratio) for symbol, weight in portfolio_weights.items()],
             True
         )
 
         # Debugging: Confirm rebalancing
         self.debug(f"Rebalanced portfolio with targets:\n{portfolio_weights}")
+        self.debug(f"Rebalanced using {self.capital_allocation_ratio * 100:.0f}% of portfolio.")
 
 class MarketCapFactor:
     def __init__(self, security):
