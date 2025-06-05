@@ -1,142 +1,140 @@
-# region imports
-from AlgorithmImports import *
-from scipy import optimize
-from scipy.optimize import Bounds
-# endregion
+def _rebalance(self):
+        # Skip if no securities selected yet or not enough historical data
+        if not self._universe.selected:
+            self.debug("No securities selected in universe for rebalance.")
+            return
 
-class FactorWeightOptimizationAlgorithm(QCAlgorithm):
-    def initialize(self):
-        # Set the start date for the algorithm
-        self.set_start_date(2016, 1, 1)
-        # Set the starting cash for the portfolio
-        self.set_cash(100000)
-        # Enable automatic warm-up of indicators
-        self.settings.automatic_indicator_warm_up = True
-
-        # Create a symbol for the SPY ETF
-        spy = Symbol.create('SPY', SecurityType.EQUITY, Market.USA)
-
-        # Fetch parameters or use default values
-        universe_size = 2 # seletcs 2 stocks out of the universe
-        self._lookback = 21 # selects the lockback period
-
-        # Debugging: Log parameter values
-        self.debug(f"Initialized with universe_size: {universe_size}, lookback: {self._lookback}")
-
-        # Add a universe of securities with hourly resolution
-        self.universe_settings.resolution = Resolution.HOUR
-        self._universe = self.add_universe(
-            self.universe.etf(
-                spy,
-                universe_filter_func=lambda constituents: [
-                    c.symbol for c in sorted(
-                        [c for c in constituents if c.weight],
-                        key=lambda c: c.weight
-                    )[-universe_size:]
-                ]
-            )
-        )
-
-        # Schedule rebalancing on the first trading day of the month
-        self.schedule.on(
-            self.date_rules.month_start(spy),
-            self.time_rules.after_market_open(spy, 31),
-            self._rebalance
-        )
-
-    def on_securities_changed(self, changes):
-        # When securities are added to the universe, assign factors to them
-        for security in changes.added_securities:
-            security.factors = [
-                MarketCapFactor(security),
-                SortinoFactor(self, security.symbol, self._lookback)
-            ]
-
-            # Debugging: Log added securities and their factors
-            self.debug(f"Added security: {security.Symbol}, factors: {[type(f).__name__ for f in security.factors]}")
-
-    def _rebalance(self):
-        # Initialize a DataFrame to store factor values
-        factors_df = pd.DataFrame()
+        # Ensure all factors are ready for calculation
+        ready_symbols = []
         for symbol in self._universe.selected:
-            # Collect the factor values for each security
-            for i, factor in enumerate(self.securities[symbol].factors):
-                factors_df.loc[symbol, i] = factor.value
+            security = self.securities[symbol]
+            if hasattr(security, 'factors') and all(f.value is not None and f.is_ready for f in security.factors):
+                ready_symbols.append(symbol)
+            else:
+                self.debug(f"Skipping {symbol} as factors are not ready or values are None.")
 
-        # Debugging: Log factor values
-        self.debug(f"Factor values DataFrame:\n{factors_df}")
+        if not ready_symbols:
+            self.debug("No symbols with ready factors for rebalance. Liquidating all positions.")
+            self.liquidate()
+            return
 
-        # Standardize factor values (z-scores)
-        factor_zscores = (factors_df - factors_df.mean()) / factors_df.std()
-        self.debug(f"Factor Z-scores:\n{factor_zscores}")
+        # Collect factor values for current ready symbols
+        factors_data = {}
+        for symbol in ready_symbols:
+            security = self.securities[symbol]
+            factors_data[symbol] = [f.value for f in security.factors]
 
-        # Get the trailing return for the lookback period
-        trailing_return = self.history(
-            list(self._universe.selected), self._lookback, Resolution.DAILY
-        ).close.unstack(0).pct_change(self._lookback - 1).iloc[-1]
+        factors_df = pd.DataFrame.from_dict(factors_data, orient='index')
+        factors_df.columns = [f"Factor_{i}" for i in range(len(security.factors))] # Naming factors
 
-        # Debugging: Log trailing returns
-        self.debug(f"Trailing Returns:\n{trailing_return}")
+        if factors_df.empty:
+            self.debug("Factor DataFrame is empty after filtering for ready factors. Liquidating all positions.")
+            self.liquidate()
+            return
 
-        # Number of factors to optimize
-        num_factors = factors_df.shape[1]
+        # Standardize factor values into Z-scores
+        std_devs = factors_df.std()
+        # Add a small epsilon to avoid division by zero if std_dev is 0
+        factor_zscores = (factors_df - factors_df.mean()) / (std_devs + 1e-9)
 
-        # Perform optimization to find optimal factor weights
-        factor_weights = optimize.minimize(
-            lambda weights: -(np.dot(factor_zscores, weights) * trailing_return).sum(),
-            x0=np.array([1.0 / num_factors] * num_factors),
-            method='Nelder-Mead',
-            bounds=Bounds([0] * num_factors, [1] * num_factors),
-            options={'maxiter': 10}
-        ).x
+        # Calculate trailing returns
+        trailing_returns = {}
+        for symbol in ready_symbols:
+            history = self.history(symbol, timedelta(days=self._lookback), Resolution.DAILY)
+            if not history.empty and 'close' in history:
+                # Ensure enough data points for lookback
+                if len(history['close']) >= self._lookback:
+                    current_price = history['close'].iloc[-1]
+                    lookback_price = history['close'].iloc[0]
+                    if lookback_price != 0:
+                        trailing_returns[symbol] = (current_price - lookback_price) / lookback_price
+                    else:
+                        trailing_returns[symbol] = 0.0
+                else:
+                    self.debug(f"Not enough historical data for {symbol} for {self._lookback} days trailing return.")
+                    trailing_returns[symbol] = 0.0 # Default to 0 if not enough data
+            else:
+                self.debug(f"No historical data for {symbol} to calculate trailing return.")
+                trailing_returns[symbol] = 0.0
 
-        # Debugging: Log optimized factor weights
-        self.debug(f"Optimized Factor Weights:\n{factor_weights}")
+        # Filter out symbols with no trailing returns
+        trailing_returns_series = pd.Series(trailing_returns)
+        common_symbols = factor_zscores.index.intersection(trailing_returns_series.index)
+        if common_symbols.empty:
+            self.debug("No common symbols between factor data and trailing returns for rebalance. Liquidating all positions.")
+            self.liquidate()
+            return
 
-        # Calculate portfolio weights based on factor weights and z-scores
+        factor_zscores = factor_zscores.loc[common_symbols]
+        trailing_returns_series = trailing_returns_series.loc[common_symbols]
+
+        if factor_zscores.empty or trailing_returns_series.empty:
+            self.debug("Filtered factor_zscores or trailing_returns_series is empty. Liquidating all positions.")
+            self.liquidate()
+            return
+
+        # Optimization Function (to minimize negative sum of weighted factor * trailing return)
+        def objective(weights):
+            # Ensure weights sum to 1 to avoid trivial solutions (all zeros or all ones)
+            # This is a common way to implicitly constrain weights in unconstrained optimizers
+            normalized_weights = np.array(weights) / np.sum(np.abs(weights)) if np.sum(np.abs(weights)) != 0 else np.zeros_like(weights)
+
+            # Dot product of factor Z-scores and weights, then multiply by trailing return
+            score = (factor_zscores.dot(normalized_weights) * trailing_returns_series).sum()
+            return -score # Minimize negative score to maximize
+
+        # Initial guess for weights (equal weight for each factor)
+        initial_weights = np.ones(len(factors_df.columns)) / len(factors_df.columns)
+
+        # Bounds for weights (0 to 1 for long-only factors, sum <= 1.0 or sum = 1.0 for capital allocation)
+        # Since we are optimizing factor weights and then deriving portfolio weights, these are factor weights.
+        # You might want to adjust these bounds based on whether you want to allow negative factor weights (shorting factors).
+        # For simple factors, usually positive weights are desired.
+        bounds = [(0, 1) for _ in range(len(factors_df.columns))]
+
+        # Run optimization (Nelder-Mead is a simplex algorithm, can be slow for many variables)
+        # Using a very low maxiter is for quick demonstration, increase for better optimization.
+        result = minimize(objective, initial_weights, method='Nelder-Mead', bounds=bounds, options={'maxiter': 100})
+        factor_weights = result.x
+
+        self.debug(f"Optimized Factor Weights: {factor_weights}")
+
+        # Calculate final portfolio weights based on optimized factor weights and Z-scores
+        # Multiply factor Z-scores by optimized factor weights and sum across factors for each symbol
         portfolio_weights = (factor_zscores * factor_weights).sum(axis=1)
+
+        # Filter out assets with non-positive portfolio weights (for long-only strategy)
         portfolio_weights = portfolio_weights[portfolio_weights > 0]
 
-        # Debugging: Log portfolio weights
-        self.debug(f"Portfolio Weights:\n{portfolio_weights}")
+        if portfolio_weights.empty or portfolio_weights.sum() == 0:
+            self.debug("No positive portfolio weights generated, or sum is zero. Liquidating all positions.")
+            self.liquidate()
+            return
 
-        # Normalize portfolio weights and set holdings
-        self.set_holdings(
-            [PortfolioTarget(symbol, weight / portfolio_weights.sum()) for symbol, weight in portfolio_weights.items()],
-            True
-        )
+        # --- Apply Maximum Single Asset Allocation Limit ---
+        # Cap each individual weight at the defined maximum
+        portfolio_weights = portfolio_weights.apply(lambda x: min(x, self.max_single_asset_allocation))
 
-        # Debugging: Confirm rebalancing
-        self.debug(f"Rebalanced portfolio with targets:\n{portfolio_weights}")
+        # Re-normalize the capped weights to ensure they sum to 1
+        # This is crucial because capping might reduce the total sum of weights.
+        current_sum_of_weights = portfolio_weights.sum()
+        if current_sum_of_weights > 0:
+            portfolio_weights = portfolio_weights / current_sum_of_weights
+        else:
+            self.debug("Sum of portfolio weights is zero after capping. Liquidating all positions.")
+            self.liquidate()
+            return
+        # --- End of Individual Limit Application ---
 
-class MarketCapFactor:
-    def __init__(self, security):
-        self._security = security
+        # --- Apply Total Portfolio Allocation Limit ---
+        # Multiply all individual weights by the total_portfolio_allocation_limit
+        # This will ensure the total allocation to all assets does not exceed this percentage.
+        portfolio_weights = portfolio_weights * self.total_portfolio_allocation_limit
+        # --- End of Total Limit Application ---
 
-    @property
-    def value(self):
-        return self._security.fundamentals.market_cap
+        targets = []
+        for symbol, weight in portfolio_weights.items():
+            targets.append(PortfolioTarget(symbol, weight))
 
-class SortinoFactor:
-    def __init__(self, algorithm, symbol, lookback):
-        self._sortino = algorithm.sortino(symbol, lookback, resolution=Resolution.DAILY)
-
-    @property
-    def value(self):
-        return self._sortino.current.value
-
-class CorrFactor:
-    def __init__(self, algorithm, symbol, reference, lookback):
-        self._c = algorithm.c(symbol, reference, lookback, correlation_type=CorrelationType.Pearson, resolution=Resolution.DAILY)
-
-    @property
-    def value(self):
-        return 1 - abs(self._c.current.value)
-
-class ROCFactor:
-    def __init__(self, algorithm, symbol, lookback):
-        self._roc = algorithm.roc(symbol, lookback, resolution=Resolution.DAILY)
-
-    @property
-    def value(self):
-        return self._roc.current.value
+        self.set_holdings(targets, True) # True for liquidation of non-targeted assets
+        self.debug(f"Set Holdings for {len(targets)} assets with total allocation of {portfolio_weights.sum():.2f}")
