@@ -1,72 +1,81 @@
-from AlgorithmImports import *
+from AlgorithmImports import *  # Import necessary libraries
+from datetime import datetime  # Import datetime module for working with dates
+import decimal  # Import decimal module for decimal arithmetic
 
-# Import strategy classes
-from Strategy1DualThrustAlgorithm import DualThrustAlgorithm
-from Strategy2FactorWeight import FactorWeightAlgorithm  # Potential Error Here
+class DualThrustAlgorithm:
+    def __init__(self, algorithm):
+        self.algorithm = algorithm
 
-class MainAlgorithm(QCAlgorithm):
-    """
-    Main algorithm class that orchestrates multiple sub-algorithms.
-    """
+        # Set cash allocation for this strategy
+        self.algorithm.SetCash(80000) # Total brokerage account balance !! ignored by live trading algo
+        
+        # Fixed investment amount per stock
+        self.investment_amount_per_stock = 0.05 # amount of investment per stock
 
-    def Initialize(self):
-        """
-        Initializes the algorithm. Sets universe settings, start date, and brokerage model.
-        Also initializes the sub-algorithms and schedules daily emails.
-        """
+        # List of symbols to trade
+        self.symbols = ["DELL", "MSFT", "AAPL", "AVGO", "NVDA"]
 
-        self.SetStartDate(2025, 6, 1)
-        self.AddEquity("SPY", Resolution.Daily)
-        self.Settings.DailyPreciseEndTime = False
-        self.UniverseSettings.Resolution = Resolution.Minute
-        self.UniverseSettings.ExtendedMarketHours = True
-        self.SetBrokerageModel(BrokerageName.InteractiveBrokersBrokerage, AccountType.Margin)
-
-        self.strategy_dual_thrust = DualThrustAlgorithm(self)
-        # self.strategy_factor_weight = FactorWeightAlgorithm(self)
-
-        # Schedule daily emails at multiple times
-        for hour, minute in [(4, 0), (9, 30), (16, 0)]:
-            self.Schedule.On(
-                self.DateRules.EveryDay("SPY"),
-                self.TimeRules.At(hour, minute),
-                self.SendDailyBalanceEmail
-            )
-
-    def OnData(self, data):
-        """
-        Handles incoming data. Passes the data to each sub-algorithm.
-
-        Args:
-            data: The incoming data dictionary.
-        """
-        self.strategy_dual_thrust.OnData(data)
-        # self.strategy_factor_weight.OnData(data)
-
-    def SendDailyBalanceEmail(self):
-        cash = self.Portfolio.Cash
-        total_value = self.Portfolio.TotalPortfolioValue
-        pnl = self.Portfolio.TotalUnrealizedProfit
-
-        subject = f"Daily Balance Report - {self.Time.strftime('%Y-%m-%d')}"
-        message = (
-            f"Portfolio Report for {self.Time.date()}:\n\n"
-            f"Cash: ${cash:,.2f}\n"
-            f"Total Portfolio Value: ${total_value:,.2f}\n"
-            f"Unrealized PnL: ${pnl:,.2f}\n"
-        )
-
-        invested = [kv for kv in self.Portfolio.Values if kv.Invested]
-        if invested:
-            message += "\nOpen Positions:\n"
-            for holding in invested:
-                message += f"- {holding.Symbol.Value}: {holding.Quantity} @ {holding.AveragePrice:.2f} = ${holding.Quantity * holding.AveragePrice:,.2f} \n"
+        # Initialize dictionaries to store trigger values and current open prices for each symbol
+        self.selltrig = {}
+        self.buytrig = {}
+        self.currentopen = {}
+        
+        # Add securities and schedule events for each symbol
+        for symbol in self.symbols:
+            equity = self.algorithm.AddEquity(symbol, Resolution.MINUTE)
+            self.selltrig[symbol] = 0.0  # Initialize sell trigger with a default value
+            self.buytrig[symbol] = 0.0   # Initialize buy trigger with a default value
+            self.currentopen[symbol] = 0.0  # Initialize current open price with a default value
+            # self.algorithm.Schedule.On(self.algorithm.DateRules.EveryDay(symbol), self.algorithm.TimeRules.AfterMarketOpen(symbol, 0), lambda symbol=symbol: self.SetSignal(symbol))
+    
+    def SetSignal(self, symbol):  # Define the SetSignal method
+        # Retrieve historical data
+        history = self.algorithm.History([symbol], 4, Resolution.DAILY)
+        
+        # Set parameters
+        k_parameter = 0.5  # Fixed k_parameter value
+        k1 = k_parameter
+        k2 = k_parameter
+        high = history.loc[symbol]['high']  # High prices in historical data
+        low = history.loc[symbol]['low']    # Low prices in historical data
+        close = history.loc[symbol]['close']  # Close prices in historical data
+        
+        # Get current opening price
+        self.currentopen[symbol] = self.algorithm.Portfolio[symbol].Price
+        
+        # Calculate thresholds
+        HH, HC, LC, LL = max(high), max(close), min(close), min(low)  # Calculate HH, HC, LC, LL
+        if HH - LC >= HC - LL:
+            signalrange = HH - LC  # Calculate signal range
         else:
-            message += "\nNo active positions."
-
-        # Send email notification (works in live mode)
-        self.Notify.Email("jowalz@web.de", subject, message)
-
-        # Debug output (works in backtest)
-        self.Debug(f"[EMAIL TEST] {subject}\n{message}")
-        self.Log(f"Scheduled email function ran at {self.Time.strftime('%Y-%m-%d %H:%M:%S')}")
+            signalrange = HC - LL
+        
+        self.selltrig[symbol] = float(self.currentopen[symbol]) - float(k1) * signalrange  # Calculate sell trigger
+        self.buytrig[symbol] = float(self.currentopen[symbol]) + float(k2) * signalrange    # Calculate buy trigger
+    
+    def OnData(self, data):
+        min_order_size = 2  # Set your minimum order size here
+        for symbol in self.symbols:
+            if self.selltrig[symbol] is None:
+                continue
+            holdings = self.algorithm.Portfolio[symbol].Quantity
+            order_size = abs(self.algorithm.CalculateOrderQuantity(symbol, self.investment_amount_per_stock))
+            if order_size < min_order_size:
+                # self.algorithm.Debug(f"The calculated order size for {symbol} is less than the minimum order size. Skipping order.")
+                continue
+            if self.algorithm.Portfolio[symbol].Price >= self.selltrig[symbol]:
+                if holdings >= 0:
+                    self.algorithm.SetHoldings(symbol, self.investment_amount_per_stock)
+                else:
+                    self.algorithm.Liquidate(symbol)
+                    self.algorithm.SetHoldings(symbol, self.investment_amount_per_stock)
+            elif self.algorithm.Portfolio[symbol].Price < self.selltrig[symbol]:
+                if holdings >= 0:
+                    self.algorithm.Liquidate(symbol)
+                    self.algorithm.SetHoldings(symbol, -self.investment_amount_per_stock)
+                else:
+                    self.algorithm.SetHoldings(symbol, -self.investment_amount_per_stock)
+        
+        # Log current open, buy, and sell thresholds for each symbol
+        # for symbol in self.symbols:
+            # self.algorithm.Log("open for " + symbol + ": " + str(self.currentopen[symbol]) + ", buy: " + str(self.buytrig[symbol]) + ", sell: " + str(self.selltrig[symbol]))
