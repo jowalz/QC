@@ -1,0 +1,142 @@
+# region imports
+from AlgorithmImports import *
+from scipy import optimize
+from scipy.optimize import Bounds
+# endregion
+
+class FactorWeightOptimizationAlgorithm(QCAlgorithm):
+    def initialize(self):
+        # Set the start date for the algorithm
+        self.set_start_date(2016, 1, 1)
+        # Set the starting cash for the portfolio
+        self.set_cash(100000)
+        # Enable automatic warm-up of indicators
+        self.settings.automatic_indicator_warm_up = True
+
+        # Create a symbol for the SPY ETF
+        spy = Symbol.create('SPY', SecurityType.EQUITY, Market.USA)
+
+        # Fetch parameters or use default values
+        universe_size = 2 # seletcs 2 stocks out of the universe
+        self._lookback = 21 # selects the lockback period
+
+        # Debugging: Log parameter values
+        self.debug(f"Initialized with universe_size: {universe_size}, lookback: {self._lookback}")
+
+        # Add a universe of securities with hourly resolution
+        self.universe_settings.resolution = Resolution.HOUR
+        self._universe = self.add_universe(
+            self.universe.etf(
+                spy,
+                universe_filter_func=lambda constituents: [
+                    c.symbol for c in sorted(
+                        [c for c in constituents if c.weight],
+                        key=lambda c: c.weight
+                    )[-universe_size:]
+                ]
+            )
+        )
+
+        # Schedule rebalancing on the first trading day of the month
+        self.schedule.on(
+            self.date_rules.month_start(spy),
+            self.time_rules.after_market_open(spy, 31),
+            self._rebalance
+        )
+
+    def on_securities_changed(self, changes):
+        # When securities are added to the universe, assign factors to them
+        for security in changes.added_securities:
+            security.factors = [
+                MarketCapFactor(security),
+                SortinoFactor(self, security.symbol, self._lookback)
+            ]
+
+            # Debugging: Log added securities and their factors
+            self.debug(f"Added security: {security.Symbol}, factors: {[type(f).__name__ for f in security.factors]}")
+
+    def _rebalance(self):
+        # Initialize a DataFrame to store factor values
+        factors_df = pd.DataFrame()
+        for symbol in self._universe.selected:
+            # Collect the factor values for each security
+            for i, factor in enumerate(self.securities[symbol].factors):
+                factors_df.loc[symbol, i] = factor.value
+
+        # Debugging: Log factor values
+        self.debug(f"Factor values DataFrame:\n{factors_df}")
+
+        # Standardize factor values (z-scores)
+        factor_zscores = (factors_df - factors_df.mean()) / factors_df.std()
+        self.debug(f"Factor Z-scores:\n{factor_zscores}")
+
+        # Get the trailing return for the lookback period
+        trailing_return = self.history(
+            list(self._universe.selected), self._lookback, Resolution.DAILY
+        ).close.unstack(0).pct_change(self._lookback - 1).iloc[-1]
+
+        # Debugging: Log trailing returns
+        self.debug(f"Trailing Returns:\n{trailing_return}")
+
+        # Number of factors to optimize
+        num_factors = factors_df.shape[1]
+
+        # Perform optimization to find optimal factor weights
+        factor_weights = optimize.minimize(
+            lambda weights: -(np.dot(factor_zscores, weights) * trailing_return).sum(),
+            x0=np.array([1.0 / num_factors] * num_factors),
+            method='Nelder-Mead',
+            bounds=Bounds([0] * num_factors, [1] * num_factors),
+            options={'maxiter': 10}
+        ).x
+
+        # Debugging: Log optimized factor weights
+        self.debug(f"Optimized Factor Weights:\n{factor_weights}")
+
+        # Calculate portfolio weights based on factor weights and z-scores
+        portfolio_weights = (factor_zscores * factor_weights).sum(axis=1)
+        portfolio_weights = portfolio_weights[portfolio_weights > 0]
+
+        # Debugging: Log portfolio weights
+        self.debug(f"Portfolio Weights:\n{portfolio_weights}")
+
+        # Normalize portfolio weights and set holdings
+        self.set_holdings(
+            [PortfolioTarget(symbol, weight / portfolio_weights.sum()) for symbol, weight in portfolio_weights.items()],
+            True
+        )
+
+        # Debugging: Confirm rebalancing
+        self.debug(f"Rebalanced portfolio with targets:\n{portfolio_weights}")
+
+class MarketCapFactor:
+    def __init__(self, security):
+        self._security = security
+
+    @property
+    def value(self):
+        return self._security.fundamentals.market_cap
+
+class SortinoFactor:
+    def __init__(self, algorithm, symbol, lookback):
+        self._sortino = algorithm.sortino(symbol, lookback, resolution=Resolution.DAILY)
+
+    @property
+    def value(self):
+        return self._sortino.current.value
+
+class CorrFactor:
+    def __init__(self, algorithm, symbol, reference, lookback):
+        self._c = algorithm.c(symbol, reference, lookback, correlation_type=CorrelationType.Pearson, resolution=Resolution.DAILY)
+
+    @property
+    def value(self):
+        return 1 - abs(self._c.current.value)
+
+class ROCFactor:
+    def __init__(self, algorithm, symbol, lookback):
+        self._roc = algorithm.roc(symbol, lookback, resolution=Resolution.DAILY)
+
+    @property
+    def value(self):
+        return self._roc.current.value
