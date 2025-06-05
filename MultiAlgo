@@ -2,7 +2,7 @@ from AlgorithmImports import *
 
 # Import strategy classes
 from Strategy1DualThrustAlgorithm import DualThrustAlgorithm
-from Strategy2FactorWeight import FactorWeightAlgorithm # Potential Error Here
+from Strategy2FactorWeight import FactorWeightAlgorithm  # Potential Error Here
 
 class MainAlgorithm(QCAlgorithm):
     """
@@ -12,15 +12,26 @@ class MainAlgorithm(QCAlgorithm):
     def Initialize(self):
         """
         Initializes the algorithm. Sets universe settings, start date, and brokerage model.
-        Also initializes the sub-algorithms.
+        Also initializes the sub-algorithms and schedules daily emails.
         """
+
+        self.SetStartDate(2025, 6, 1)
+        self.AddEquity("SPY", Resolution.Daily)
+        self.Settings.DailyPreciseEndTime = False
         self.UniverseSettings.Resolution = Resolution.Minute
         self.UniverseSettings.ExtendedMarketHours = True
-        self.SetStartDate(2024, 6, 22)
         self.SetBrokerageModel(BrokerageName.InteractiveBrokersBrokerage, AccountType.Margin)
 
         self.strategy_dual_thrust = DualThrustAlgorithm(self)
         # self.strategy_factor_weight = FactorWeightAlgorithm(self)
+
+        # Schedule daily emails at multiple times
+        for hour, minute in [(4, 0), (9, 30), (16, 0)]:
+            self.Schedule.On(
+                self.DateRules.EveryDay("SPY"),
+                self.TimeRules.At(hour, minute),
+                self.SendDailyBalanceEmail
+            )
 
     def OnData(self, data):
         """
@@ -31,3 +42,31 @@ class MainAlgorithm(QCAlgorithm):
         """
         self.strategy_dual_thrust.OnData(data)
         # self.strategy_factor_weight.OnData(data)
+
+    def SendDailyBalanceEmail(self):
+        cash = self.Portfolio.Cash
+        total_value = self.Portfolio.TotalPortfolioValue
+        pnl = self.Portfolio.TotalUnrealizedProfit
+
+        subject = f"Daily Balance Report - {self.Time.strftime('%Y-%m-%d')}"
+        message = (
+            f"Portfolio Report for {self.Time.date()}:\n\n"
+            f"Cash: ${cash:,.2f}\n"
+            f"Total Portfolio Value: ${total_value:,.2f}\n"
+            f"Unrealized PnL: ${pnl:,.2f}\n"
+        )
+
+        invested = [kv for kv in self.Portfolio.Values if kv.Invested]
+        if invested:
+            message += "\nOpen Positions:\n"
+            for holding in invested:
+                message += f"- {holding.Symbol.Value}: {holding.Quantity} @ {holding.AveragePrice:.2f} = ${holding.Quantity * holding.AveragePrice:,.2f} \n"
+        else:
+            message += "\nNo active positions."
+
+        # Send email notification (works in live mode)
+        self.Notify.Email("jowalz@web.de", subject, message)
+
+        # Debug output (works in backtest)
+        self.Debug(f"[EMAIL TEST] {subject}\n{message}")
+        self.Log(f"Scheduled email function ran at {self.Time.strftime('%Y-%m-%d %H:%M:%S')}")
