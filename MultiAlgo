@@ -1,0 +1,33 @@
+from AlgorithmImports import *
+
+# Import strategy classes
+from Strategy1DualThrustAlgorithm import DualThrustAlgorithm
+from Strategy2FactorWeight import FactorWeightAlgorithm # Potential Error Here
+
+class MainAlgorithm(QCAlgorithm):
+    """
+    Main algorithm class that orchestrates multiple sub-algorithms.
+    """
+
+    def Initialize(self):
+        """
+        Initializes the algorithm. Sets universe settings, start date, and brokerage model.
+        Also initializes the sub-algorithms.
+        """
+        self.UniverseSettings.Resolution = Resolution.Minute
+        self.UniverseSettings.ExtendedMarketHours = True
+        self.SetStartDate(2024, 6, 22)
+        self.SetBrokerageModel(BrokerageName.InteractiveBrokersBrokerage, AccountType.Margin)
+
+        self.strategy_dual_thrust = DualThrustAlgorithm(self)
+        # self.strategy_factor_weight = FactorWeightAlgorithm(self)
+
+    def OnData(self, data):
+        """
+        Handles incoming data. Passes the data to each sub-algorithm.
+
+        Args:
+            data: The incoming data dictionary.
+        """
+        self.strategy_dual_thrust.OnData(data)
+        # self.strategy_factor_weight.OnData(data)
