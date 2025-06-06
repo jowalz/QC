@@ -1,0 +1,291 @@
+from AlgorithmImports import *
+
+class HarmonicPatternESFuturesAlgorithm(QCAlgorithm):
+    """
+    This algorithm implements a "Harmonic Pattern" strategy for trading ES futures.
+    It identifies ZigZag points and attempts to detect harmonic patterns, for example the ABCD pattern.
+    """
+
+    def Initialize(self):
+        """ Initializes the algorithm with settings, data, and variables. ✅ Check 23.04.2025"""
+        
+        self.SetStartDate(2025, 5, 25)  # Set the start date for backtesting
+        # self.SetEndDate(2031, 1 1)  # Optionally set an end date
+        self.SetCash(100000)  # Set the initial cash for the strategy
+        # self.set_time_zone("Europe/Berlin")  # Set the time zone
+        self.SetBrokerageModel(BrokerageName.InteractiveBrokersBrokerage, AccountType.Margin)  # Set brokerage and account type
+        self.settings.daily_precise_end_time = False
+        ticker = Futures.Indices.SP500EMini # Set future 
+        res = Resolution.Second # Set resolution !! Minute or Second might be a huge difference
+        extMarket = False # Set usage of extended market hours (True or False)
+        self.inverse_trade = 1 # 1 for regular trades / -1 for inverse trades
+        self.order_multiplier = 1 # adjusts the sl / tp 
+
+        # Add ES futures with a 1-minute resolution ✅ Check 23.04.2025
+        es = self.AddFuture(ticker, res, extendedMarketHours=extMarket)
+        es.SetFilter(timedelta(days=0), timedelta(days=90)) # Filtering contracts to roll within 3 months
+        self.es_symbol = None  # Variable to store the current ES futures symbol (will be updated during contract rollover)
+
+        # Initialize variables for ZigZag logic and pattern detection ✅ Check 23.04.2025
+        self.occurrences = []  # List to store occurrences for ZigZag points
+        self.previous_high = None  # Store the previous high price
+        self.previous_low = None  # Store the previous low price
+        self.current_direction = 0  # 1 for up, -1 for down (current trend direction)
+        self.previous_direction = 0  # 1 for up, -1 for down (previous trend direction)
+        self.current_zigzag = None  # Store the current ZigZag point
+        self.highest_high = None  # Store the highest high price of the day
+        self.lowest_low = None  # Store the lowest low price of the day
+        self.entry_ticket = None  # Placeholder for entry order tickets
+
+        # Create a consolidator for 8-minute bars ✅ Check 23.04.2025
+        self.consolidator = TradeBarConsolidator(timedelta(minutes=8))  # Consolidate 1-minute bars into 8-minute bars
+        self.consolidator.DataConsolidated += self.On8MinuteBar  # Event handler for consolidated 8-minute bars
+        self.SubscriptionManager.AddConsolidator(es.Symbol, self.consolidator) # Add the consolidator to the subscription manager
+
+        # Initialize the RollingWindow with a size of 30 to hold the last two 8-minute bars ✅ Check 23.04.2025
+        self.rolling_window = RollingWindow[TradeBar](30)  # Rolling window to store the last 10 8-minute bars
+
+        # self.set_risk_management(NullRiskManagementModel())
+        # self.set_risk_management(TrailingStopRiskManagementModel(0.002))
+        # self.add_risk_management(MaximumUnrealizedProfitPercentPerSecurity(0.0015)) # ist wie takeprofit 0.0015
+        # self.add_risk_management(MaximumDrawdownPercentPerSecurity(0.001)) # ist wie stop loss 0.001
+        # self.add_risk_management(MaximumDrawdownPercentPortfolio(0.05))
+
+    def OnData(self, slice):
+        """Handles incoming data, including futures contract rollover."""
+        # Handling futures contract rollover
+        for chain in slice.FutureChains:
+            for contract in chain.Value:
+                if contract.Expiry > self.Time:  # Check if the contract expiry date is in the future
+                    self.es_symbol = contract.Symbol  # Update the ES symbol to the new contract
+                    break
+
+
+    def On8MinuteBar(self, sender, bar):
+        """Processes the 8-minute bars for ZigZag logic and pattern detection. ✅ Check 23.04.2025"""
+
+        self.rolling_window.Add(bar)  # Add the 8-minute bar to the rolling window
+
+        if self.rolling_window.IsReady:  # Check if the rolling window has enough data
+            pprevious_bar = self.rolling_window[2]  # Get the second-to-last 8-minute bar
+            previous_bar = self.rolling_window[1]  # Get the last 8-minute bar
+            current_bar = self.rolling_window[0]  # Get the current 8-minute bar
+
+            # Update ZigZag logic current direction
+            if current_bar.Close >= current_bar.Open:  # Up bar
+                self.current_direction = 1
+            elif current_bar.Close < current_bar.Open:  # Down bar
+                self.current_direction = -1
+
+            # Update ZigZag logic previous direction
+            if previous_bar.Close >= previous_bar.Open:  # Up bar
+                self.previous_direction = 1
+            elif previous_bar.Close < previous_bar.Open:  # Down bar
+                self.previous_direction = -1
+
+            if self.current_zigzag is None:
+                self.current_zigzag = current_bar.Close  # Initialize the current ZigZag point
+                return  # Exit the method if the current ZigZag point is not yet set
+
+            # condition for "up" change
+            if self.current_direction == 1 and self.previous_direction == -1:  # Check for an up change in direction
+                self.current_zigzag = previous_bar.Low  # Update the ZigZag point to the previous low
+                
+
+                # Check if occurrences is not empty before accessing the last element
+                if len(self.occurrences) < 5:  # Check if the number of occurrences is less than 5
+                    if len(self.occurrences) == 0 or self.occurrences[-1] != previous_bar.Low:  # Check if the last occurrence is different
+                        self.occurrences.append(previous_bar.Low)  # Add the new low to the occurrences list
+                else:
+                    if self.occurrences[-1] != previous_bar.Low:  # Check if the last occurrence is different
+                        self.occurrences.pop(0)  # Remove the oldest occurrence
+                        self.occurrences.append(previous_bar.Low)  # Add the new low to the occurrences list
+                        self.CalculateFibonacciLevels()  # Fibonacci level calculation
+                    self.CheckForPatterns()  # Check for patterns based on the occurrences
+
+            # condition for "down" change
+            elif self.current_direction == -1 and self.previous_direction == 1:  # Check for a down change in direction
+                self.current_zigzag = previous_bar.High  # Update the ZigZag point to the previous high
+
+                # Check if occurrences is not empty before accessing the last element
+                if len(self.occurrences) < 5:  # Check if the number of occurrences is less than 5
+                    if len(self.occurrences) == 0 or self.occurrences[-1] != previous_bar.High:  # Check if the last occurrence is different
+                        self.occurrences.append(previous_bar.High)  # Add the new high to the occurrences list
+                else:
+                    if self.occurrences[-1] != previous_bar.High:  # Check if the last occurrence is different
+                        self.occurrences.pop(0)  # Remove the oldest occurrence
+                        self.occurrences.append(previous_bar.High)  # Add the new high to the occurrences list
+                        self.CalculateFibonacciLevels()  # Fibonacci level calculation
+                    self.CheckForPatterns()  # Check for patterns based on the occurrences
+
+            # Log the ZigZag value and direction
+            direction_text = "Up" if self.current_direction == 1 else "Down"  # Get the direction text
+            # self.Debug(f"Bar Value: {current_bar}, ZigZag Value: {self.current_zigzag}, ZigZagList: {self.occurrences}, Direction: {direction_text}")
+
+    def CheckForPatterns(self):
+        """Checks for patterns based on the identified ZigZag points."""
+
+        if self.es_symbol is None:  # Ensure ES symbol is initialized
+            self.Debug("ES symbol not yet assigned.")
+            return  # Exit if the ES symbol is not yet assigned
+            
+        # Assuming the patterns are detected based on some custom logic
+        # This is where you would implement the harmonic pattern recognition logic
+
+        if len(self.occurrences) == 5:  # Check if there are 5 ZigZag points (required for ABCD pattern)
+            x, a, b, c, d = self.occurrences  # Get the last 5 occurrences
+
+            # Calculate Fibonacci ratios
+            xab = abs(b - a) / abs(x - a)
+            xad = abs(a - d) / abs(x - a)
+            abc = abs(b - c) / abs(a - b)
+            bcd = abs(c - d) / abs(b - c)
+            # self.Debug(f"xab {xab}, bcd: {bcd}")
+
+            is_pattern, pattern_name = self.IsHarmonicPattern(xab, abc, bcd, xad)
+            if is_pattern: # Check if the ratios meet the Harmonic pattern criteria
+                direction = "Bullish" if c > d else "Bearish"
+                tradedirection = 1 if c > d else -1
+                full_pattern_name = f"{direction} {pattern_name}"
+                self.Debug(f"Harmonic Pattern detected: {full_pattern_name}")
+                self.ExecuteOrder(tradedirection)  # Execute an order based on the pattern
+    
+    def IsHarmonicPattern(self, xab, abc, bcd, xad):
+        """
+        Checks if the calculated Fibonacci ratios match a known Harmonic pattern.
+        Returns (is_match: bool, pattern_name: str)
+        """
+        if (0.382 <= abc <= 0.886) and (1.13 <= bcd <= 2.618):
+            return True, "ABCD"
+
+        if (0.382 <= xab <= 0.5) and (0.382 <= abc <= 0.886) and (1.618 <= bcd <= 2.618) and xad <= 1.000:
+            return True, "Bat"
+
+        if (0.5 <= xab <= 0.618) and (0.382 <= abc <= 0.886) and (1.13 <= bcd <= 2.618) and (0.75 <= xad <= 0.875):
+            return True, "Gartley"
+
+        if (xab <= 0.786) and (0.382 <= abc <= 0.886) and (1.618 <= bcd <= 2.618) and (1.27 <= xad <= 1.618):
+            return True, "Butterfly"
+
+        if (0.5 <= xab <= 0.875) and (0.382 <= abc <= 0.886) and (2.0 <= bcd <= 5.0) and (1.382 <= xad <= 5.0):
+            return True, "Crab"
+
+        if (0.5 <= xab <= 0.875) and (1.13 <= abc <= 1.618) and (1.27 <= bcd <= 2.24) and (0.886 <= xad <= 1.13):
+            return True, "Shark"
+
+        if (0.236 <= xab <= 0.886) and (1.0 <= abc <= 2.618) and (1.618 <= bcd <= 2.618) and (0.886 <= xad <= 1.000):
+            return True, "AntiBat"
+
+        if (0.25 <= xab <= 0.5) and (1.13 <= abc <= 2.618) and (1.618 <= bcd <= 2.618) and (0.5 <= xad <= 0.75):
+            return True, "AntiCrab"
+
+        if (xab <= 0.382) and (0.382 <= abc <= 0.886) and (2.0 <= bcd <= 3.618) and (xad <= 1.13):
+            return True, "AltBat"
+
+        if (0.382 <= xab <= 0.618) and (0.382 <= abc <= 0.618) and (0.382 <= bcd <= 0.618) and (0.236 <= xad <= 0.764):
+            return True, "ConTria"
+
+        if (1.236 <= xab <= 1.618) and (1.0 <= abc <= 1.618) and (1.236 <= bcd <= 2.0) and (2.0 <= xad <= 2.236):
+            return True, "ExpTria"
+
+        if (1.13 <= xab <= 1.618) and (1.618 <= abc <= 2.24) and (0.5 <= bcd <= 0.625) and (0.0 <= xad <= 0.236):
+            return True, "5o"
+
+        if (1.27 <= xab <= 1.618) and (1.27 <= bcd <= 1.618):
+            return True, "Wolf"
+
+        if (2.0 <= xab <= 10) and (0.9 <= abc <= 1.1) and (0.236 <= bcd <= 0.88) and (0.9 <= xad <= 1.1):
+            return True, "HnS"
+
+        return False, ""
+
+
+    def ExecuteOrder(self, tradedirection):
+        """Executes a limit order with attached stop-loss and take-profit bracket orders."""
+
+        if self.es_symbol is None:
+            self.Debug("ES symbol not yet assigned.")
+            return  # Exit if the ES symbol is not yet assigned
+
+        # Check if portfolio is invested in the symbol and liquidate in case the direction is different ✅ Update 07.05.2025"""
+        if self.Portfolio[self.es_symbol].Invested:
+            # Determine the current position direction: 1 for long, -1 for short
+            current_position_direction = 1 if self.Portfolio[self.es_symbol].IsLong else -1
+            
+            # If the position is in the opposite direction, liquidate
+            if current_position_direction != self.current_direction:
+                self.Liquidate(self.es_symbol)
+                self.Debug(f"Liquidated position for {self.es_symbol} due to direction change")
+            else:
+                # Position already in the desired direction, no action needed
+                return
+
+        # Example of executing a limit order at the market open price with logging of the fill price
+        # Get the current market open price
+        current_open_price = round(self.Securities[self.es_symbol].Close * 4) / 4
+
+        if current_open_price != 0:  # Check if the open price is not zero
+            # ❌ original direction from zig zagl quantity = 1 * self.current_direction *  self.inverse_trade  # Set the order size to 1 contract (long or short based on direction)
+            quantity = 1 * tradedirection *  self.inverse_trade  # Set the order size to 1 contract (long or short based on direction)
+            # Place a primary limit order at the current open price
+            # self.entry_ticket = self.LimitOrder(self.es_symbol, quantity, current_open_price)
+            self.entry_ticket = self.LimitOrder(self.es_symbol, quantity, self.ew_target)
+            # Log the order submission
+            self.Debug(f"Submitted LimitOrder for {self.es_symbol} with quantity {quantity} at price {current_open_price}, direction {self.current_direction}")
+
+    def CalculateFibonacciLevels(self):
+        """Calculates Fibonacci levels based on ZigZag points (not used in current implementation)."""
+
+        if self.es_symbol is None:  # Ensure ES symbol is initialized
+            self.Debug("ES symbol not yet assigned.")
+            return  # Exit if the ES symbol is not yet assigned
+
+        if len(self.occurrences) == 5:
+            x, a, b, c, d = self.occurrences  # Get the last 5 occurrences
+
+        # Calculate the Fibonacci range between points 'c' and 'd'
+        fib_range = abs(d - c)
+        fib_0000 = round(d * 4) / 4 if c < d else round((d - (fib_range * 0.000)) * 4) / 4
+        fib_0236 = round((d - (fib_range * 0.236)) * 4) / 4 if c < d else round((d + (fib_range * 0.236)) * 4) / 4
+        fib_0382 = round((d - (fib_range * 0.382)) * 4) / 4 if c < d else round((d + (fib_range * 0.382)) * 4) / 4
+        fib_0500 = round((d - (fib_range * 0.500)) * 4) / 4 if c < d else round((d + (fib_range * 0.500)) * 4) / 4
+        fib_0618 = round((d - (fib_range * 0.618)) * 4) / 4 if c < d else round((d + (fib_range * 0.618)) * 4) / 4
+        fib_0764 = round((d - (fib_range * 0.764)) * 4) / 4 if c < d else round((d + (fib_range * 0.764)) * 4) / 4
+        fib_1000 = round((d - (fib_range * 1.000)) * 4) / 4 if c < d else round((d + (fib_range * 1.000)) * 4) / 4
+
+        # Calculate targets and stop-loss levels
+        self.ew_target = fib_0236  # Placeholder for entry-withdrawal target (not used in current implementation)
+        # self.sl_target = round((fib_range * 0.618) *4)/4  # Placeholder for take-profit target (not used in current implementation)
+        self.tp_target = round((fib_range * 0.618) *4)/4
+        self.tp_percent = abs(( fib_0618 - fib_0236 ) / fib_0236 ) * self.order_multiplier 
+        self.add_risk_management(MaximumUnrealizedProfitPercentPerSecurity(self.tp_percent)) 
+        self.sl_target = round((fib_range * 0.236) *4)/4  # Placeholder for stop-loss target (not used in current implementation)
+        self.sl_percent = abs(( fib_range ) / fib_0236 ) * self.order_multiplier 
+        self.add_risk_management(MaximumDrawdownPercentPerSecurity(self.sl_percent)) 
+        self.trade_targets = [self.tp_target, self.sl_target]  # Placeholder for trade targets (not used in current implementation)
+
+        # Store Fibonacci levels in the array
+        self.fib_levels = [fib_0000, fib_0236, fib_0382, fib_0500, fib_0618, fib_0764, fib_1000]
+        ## self.Debug(f"Fibonacci Levels: {self.fib_levels}, Trade Targets: {self.trade_targets}")
+
+    def OnOrderEvent(self, orderEvent):
+        # Handles order events, including order fills.
+        # Log order event details for debugging
+        self.Debug(f"OrderEvent: {orderEvent}")
+
+        if self.es_symbol is None:  # Ensure ES symbol is initialized
+            self.Debug("ES symbol not yet assigned.")
+            return  # Exit if the ES symbol is not yet assigned
+
+    def OnEndOfDay(self):
+        """Updates the ZigZag based on the day's highest and lowest prices."""
+
+        # Update the ZigZag based on the day's highest and lowest prices
+        if self.current_direction == 1:  # If the current direction is up
+            self.highest_high = self.previous_high  # Update the highest high
+        elif self.current_direction == -1:  # If the current direction is down
+            self.lowest_low = self.previous_low  # Update the lowest low
+
+    def OnEndOfAlgorithm(self):
+        """Logs a message when the algorithm finishes running."""
+        self.Log("Algorithm finished running.")
